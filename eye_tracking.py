@@ -1,7 +1,6 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-import os
 
 
 class EyeTracker:
@@ -13,15 +12,20 @@ class EyeTracker:
         - cámara USB
         - archivos de video
 
-    Utiliza MediaPipe Face Landmarker (API Tasks).
+    Este archivo utiliza MediaPipe 0.10.x mediante:
+        mp.solutions.face_mesh.FaceMesh
+
+    Características principales utilizadas por el LSTM:
+        - gaze_x
+        - gaze_y
+        - saccade_velocity
+        - pupil_size
+        - blink
     """
 
-    # --------------------------------------------------------
-    # Landmarks del contorno ocular.
-    #
-    # Estos índices son compatibles con la malla facial
-    # de MediaPipe utilizada por el algoritmo original.
-    # --------------------------------------------------------
+    # ========================================================
+    # LANDMARKS OCULARES
+    # ========================================================
 
     LEFT_EYE = [362, 385, 387, 263, 373, 380]
     RIGHT_EYE = [33, 160, 158, 133, 153, 144]
@@ -30,86 +34,57 @@ class EyeTracker:
         self,
         blink_threshold=0.2,
         blink_window_size=5,
-        blink_cooldown=0.5,
-        model_path=None
+        blink_cooldown=0.5
     ):
+        """
+        Inicializa el rastreador ocular.
 
-        self.blink_threshold = blink_threshold
-        self.blink_window_size = blink_window_size
-        self.blink_cooldown = blink_cooldown
+        Parámetros:
+            blink_threshold:
+                Umbral EAR utilizado para detectar cierre ocular.
 
-        # ----------------------------------------------------
-        # Localizar modelo Face Landmarker
-        # ----------------------------------------------------
+            blink_window_size:
+                Número de muestras utilizadas para estabilizar
+                la detección de parpadeos.
 
-        if model_path is None:
+            blink_cooldown:
+                Tiempo mínimo entre eventos de parpadeo.
+        """
 
-            possible_paths = [
-                os.path.join(
-                    os.path.dirname(__file__),
-                    "models",
-                    "face_landmarker.task"
-                ),
-                os.path.join(
-                    os.getcwd(),
-                    "models",
-                    "face_landmarker.task"
-                ),
-                "models/face_landmarker.task",
-                "face_landmarker.task"
-            ]
-
-            for path in possible_paths:
-                if os.path.exists(path):
-                    model_path = path
-                    break
-
-        if model_path is None or not os.path.exists(model_path):
-            raise FileNotFoundError(
-                "No se encontró 'face_landmarker.task'. "
-                "Colócalo en la carpeta 'models/'."
-            )
-
-        print(
-            f"[EYE] Loading MediaPipe Face Landmarker: "
-            f"{os.path.abspath(model_path)}"
+        self.blink_threshold = float(
+            blink_threshold
         )
 
-        # ----------------------------------------------------
-        # MediaPipe Tasks
-        # ----------------------------------------------------
-
-        BaseOptions = mp.tasks.BaseOptions
-        FaceLandmarker = mp.tasks.vision.FaceLandmarker
-        FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
-        RunningMode = mp.tasks.vision.RunningMode
-
-        options = FaceLandmarkerOptions(
-            base_options=BaseOptions(
-                model_asset_path=model_path
-            ),
-            running_mode=RunningMode.VIDEO,
-            num_faces=1,
-            min_face_detection_confidence=0.5,
-            min_face_presence_confidence=0.5,
-            min_tracking_confidence=0.5,
-            output_face_blendshapes=False,
-            output_facial_transformation_matrixes=False
+        self.blink_window_size = int(
+            blink_window_size
         )
 
-        self.face_landmarker = FaceLandmarker.create_from_options(
-            options
+        self.blink_cooldown = float(
+            blink_cooldown
         )
 
-        print("[EYE] MediaPipe Face Landmarker loaded successfully.")
+        # ====================================================
+        # MEDIAPIPE FACE MESH
+        # ====================================================
 
-        # ----------------------------------------------------
-        # Estado temporal
-        # ----------------------------------------------------
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5
+        )
+
+        # ====================================================
+        # ESTADO TEMPORAL
+        # ====================================================
 
         self.ear_history = []
 
-        self.last_blink_time = -self.blink_cooldown
+        self.last_blink_time = (
+            -self.blink_cooldown
+        )
+
         self.blink_count = 0
 
         self.previous_gaze = None
@@ -117,145 +92,152 @@ class EyeTracker:
 
         self.gaze_history = []
 
-        # ----------------------------------------------------
-        # Último resultado de MediaPipe
-        #
-        # Se conserva para draw_debug() y evita volver a
-        # ejecutar MediaPipe sobre el mismo frame.
-        # ----------------------------------------------------
-
+        # Últimos landmarks detectados.
+        # Se utiliza para draw_debug() sin volver a ejecutar
+        # MediaPipe sobre el mismo frame.
         self.last_landmarks = None
 
-        # Timestamp utilizado por MediaPipe VIDEO mode.
-        self.last_timestamp_ms = -1
-
     # ========================================================
-    # UTILIDADES
+    # CALCULAR EAR
     # ========================================================
 
     @staticmethod
     def calculate_ear(eye_landmarks):
         """
-        Calcula Eye Aspect Ratio (EAR).
+        Calcula el Eye Aspect Ratio (EAR).
 
-        Se utilizan 6 landmarks:
+        Se utilizan 6 puntos:
+
             0 y 3 -> extremos horizontales
-            1 y 5 -> distancia vertical
-            2 y 4 -> distancia vertical
+            1 y 5 -> primera distancia vertical
+            2 y 4 -> segunda distancia vertical
         """
 
+        if len(eye_landmarks) != 6:
+            return 0.0
+
         A = np.linalg.norm(
-            np.array(eye_landmarks[1]) -
-            np.array(eye_landmarks[5])
+            np.array(eye_landmarks[1], dtype=np.float32)
+            -
+            np.array(eye_landmarks[5], dtype=np.float32)
         )
 
         B = np.linalg.norm(
-            np.array(eye_landmarks[2]) -
-            np.array(eye_landmarks[4])
+            np.array(eye_landmarks[2], dtype=np.float32)
+            -
+            np.array(eye_landmarks[4], dtype=np.float32)
         )
 
         C = np.linalg.norm(
-            np.array(eye_landmarks[0]) -
-            np.array(eye_landmarks[3])
+            np.array(eye_landmarks[0], dtype=np.float32)
+            -
+            np.array(eye_landmarks[3], dtype=np.float32)
         )
 
-        if C == 0:
+        if C <= 0:
             return 0.0
 
-        return (A + B) / (2.0 * C)
+        return float(
+            (A + B) / (2.0 * C)
+        )
 
     # ========================================================
-    # PROCESAMIENTO DE UN FRAME
+    # PROCESAR FRAME
     # ========================================================
 
     def process_frame(self, frame, timestamp):
         """
-        Procesa un único frame.
+        Procesa un frame.
 
         Parámetros:
             frame:
-                Imagen BGR proveniente de OpenCV.
+                Frame BGR de OpenCV.
 
             timestamp:
-                Tiempo del frame en segundos.
+                Timestamp en segundos.
 
         Retorna:
-            Diccionario con métricas o None si no se detectó
+            Diccionario de métricas o None si no se detecta
             ningún rostro.
         """
+
+        if frame is None:
+            return None
+
+        if not isinstance(frame, np.ndarray):
+            return None
+
+        if frame.ndim != 3:
+            return None
+
+        # ====================================================
+        # BGR -> RGB
+        # ====================================================
 
         frame_rgb = cv2.cvtColor(
             frame,
             cv2.COLOR_BGR2RGB
         )
 
-        # ----------------------------------------------------
-        # Convertir a MediaPipe Image
-        # ----------------------------------------------------
+        # ====================================================
+        # MEDIA PIPE
+        # ====================================================
 
-        mp_image = mp.Image(
-            image_format=mp.ImageFormat.SRGB,
-            data=frame_rgb
+        results = self.face_mesh.process(
+            frame_rgb
         )
 
-        # MediaPipe VIDEO mode requiere timestamps
-        # estrictamente crecientes en milisegundos.
-        timestamp_ms = int(timestamp * 1000)
-
-        if timestamp_ms <= self.last_timestamp_ms:
-            timestamp_ms = self.last_timestamp_ms + 1
-
-        self.last_timestamp_ms = timestamp_ms
-
-        # ----------------------------------------------------
-        # Detectar landmarks
-        # ----------------------------------------------------
-
-        results = self.face_landmarker.detect_for_video(
-            mp_image,
-            timestamp_ms
-        )
-
-        if not results.face_landmarks:
+        if not results.multi_face_landmarks:
             self.last_landmarks = None
             return None
 
-        landmarks = results.face_landmarks[0]
+        landmarks = (
+            results.multi_face_landmarks[0].landmark
+        )
 
         self.last_landmarks = landmarks
 
         height, width, _ = frame.shape
 
-        # ----------------------------------------------------
-        # Convertir landmarks normalizados a píxeles
-        # ----------------------------------------------------
+        # ====================================================
+        # LANDMARKS OCULARES EN PIXELES
+        # ====================================================
 
         left_eye = [
             (
-                int(landmarks[i].x * width),
-                int(landmarks[i].y * height)
+                int(landmarks[index].x * width),
+                int(landmarks[index].y * height)
             )
-            for i in self.LEFT_EYE
+            for index in self.LEFT_EYE
         ]
 
         right_eye = [
             (
-                int(landmarks[i].x * width),
-                int(landmarks[i].y * height)
+                int(landmarks[index].x * width),
+                int(landmarks[index].y * height)
             )
-            for i in self.RIGHT_EYE
+            for index in self.RIGHT_EYE
         ]
 
         # ====================================================
         # EAR / BLINK
         # ====================================================
 
-        left_ear = self.calculate_ear(left_eye)
-        right_ear = self.calculate_ear(right_eye)
+        left_ear = self.calculate_ear(
+            left_eye
+        )
 
-        avg_ear = (left_ear + right_ear) / 2.0
+        right_ear = self.calculate_ear(
+            right_eye
+        )
 
-        self.ear_history.append(avg_ear)
+        avg_ear = (
+            left_ear + right_ear
+        ) / 2.0
+
+        self.ear_history.append(
+            avg_ear
+        )
 
         if len(self.ear_history) > self.blink_window_size:
             self.ear_history.pop(0)
@@ -269,7 +251,9 @@ class EyeTracker:
                 for ear in self.ear_history
             )
 
-            if low_ear_count >= self.blink_window_size // 2:
+            if low_ear_count >= (
+                self.blink_window_size // 2
+            ):
 
                 if (
                     timestamp - self.last_blink_time
@@ -280,16 +264,21 @@ class EyeTracker:
                     self.last_blink_time = timestamp
 
         # ====================================================
-        # "PUPIL" / IRIS PROXY
+        # PUPIL SIZE - PROXY
         # ====================================================
         #
         # IMPORTANTE:
         #
-        # Esta característica NO es una medición real de la
+        # Esta NO es una medición física del diámetro de la
         # pupila.
         #
-        # Se conserva aquí la lógica original para mantener
-        # compatibilidad con el código existente.
+        # Para mantener compatibilidad con el procesamiento
+        # anterior, se utiliza la distancia entre los extremos
+        # horizontales de cada ojo.
+        #
+        # Por ahora se conserva exactamente esta semántica
+        # porque el modelo fue entrenado utilizando esta
+        # característica.
         # ====================================================
 
         lx0, ly0 = left_eye[0]
@@ -298,24 +287,37 @@ class EyeTracker:
         rx0, ry0 = right_eye[0]
         rx3, ry3 = right_eye[3]
 
-        left_pupil_x = (lx0 + lx3) / 2.0
-        left_pupil_y = (ly0 + ly3) / 2.0
+        left_pupil_x = (
+            lx0 + lx3
+        ) / 2.0
 
-        right_pupil_x = (rx0 + rx3) / 2.0
-        right_pupil_y = (ry0 + ry3) / 2.0
+        left_pupil_y = (
+            ly0 + ly3
+        ) / 2.0
+
+        right_pupil_x = (
+            rx0 + rx3
+        ) / 2.0
+
+        right_pupil_y = (
+            ry0 + ry3
+        ) / 2.0
 
         left_pupil_diameter = np.linalg.norm(
-            np.array([lx0, ly0]) -
-            np.array([lx3, ly3])
+            np.array([lx0, ly0], dtype=np.float32)
+            -
+            np.array([lx3, ly3], dtype=np.float32)
         )
 
         right_pupil_diameter = np.linalg.norm(
-            np.array([rx0, ry0]) -
-            np.array([rx3, ry3])
+            np.array([rx0, ry0], dtype=np.float32)
+            -
+            np.array([rx3, ry3], dtype=np.float32)
         )
 
         pupil_size = (
-            left_pupil_diameter +
+            left_pupil_diameter
+            +
             right_pupil_diameter
         ) / 2.0
 
@@ -324,12 +326,14 @@ class EyeTracker:
         # ====================================================
 
         por_x = (
-            left_pupil_x +
+            left_pupil_x
+            +
             right_pupil_x
         ) / 2.0
 
         por_y = (
-            left_pupil_y +
+            left_pupil_y
+            +
             right_pupil_y
         ) / 2.0
 
@@ -338,27 +342,32 @@ class EyeTracker:
         # ====================================================
 
         left_eye_mean = np.mean(
-            left_eye,
+            np.asarray(left_eye, dtype=np.float32),
             axis=0
         )
 
         right_eye_mean = np.mean(
-            right_eye,
+            np.asarray(right_eye, dtype=np.float32),
             axis=0
         )
 
         gaze_x = (
-            left_eye_mean[0] +
+            left_eye_mean[0]
+            +
             right_eye_mean[0]
         ) / 2.0
 
         gaze_y = (
-            left_eye_mean[1] +
+            left_eye_mean[1]
+            +
             right_eye_mean[1]
         ) / 2.0
 
+        gaze_x = float(gaze_x)
+        gaze_y = float(gaze_y)
+
         # ====================================================
-        # VELOCIDAD
+        # VELOCIDAD DE GAZE
         # ====================================================
 
         saccade_velocity = 0.0
@@ -368,36 +377,58 @@ class EyeTracker:
             and self.previous_timestamp is not None
         ):
 
-            dt = timestamp - self.previous_timestamp
+            dt = (
+                float(timestamp)
+                -
+                float(self.previous_timestamp)
+            )
 
             if dt > 0:
 
-                dx = gaze_x - self.previous_gaze[0]
-                dy = gaze_y - self.previous_gaze[1]
+                dx = (
+                    gaze_x
+                    -
+                    self.previous_gaze[0]
+                )
+
+                dy = (
+                    gaze_y
+                    -
+                    self.previous_gaze[1]
+                )
 
                 distance = np.sqrt(
-                    dx ** 2 +
+                    dx ** 2
+                    +
                     dy ** 2
                 )
 
-                saccade_velocity = distance / dt
+                saccade_velocity = (
+                    distance / dt
+                )
+
+        saccade_velocity = float(
+            saccade_velocity
+        )
 
         self.previous_gaze = (
             gaze_x,
             gaze_y
         )
 
-        self.previous_timestamp = timestamp
+        self.previous_timestamp = (
+            float(timestamp)
+        )
 
-        # ----------------------------------------------------
-        # Historial
-        # ----------------------------------------------------
+        # ====================================================
+        # HISTORIAL
+        # ====================================================
 
         self.gaze_history.append(
             (
                 gaze_x,
                 gaze_y,
-                timestamp
+                float(timestamp)
             )
         )
 
@@ -406,87 +437,117 @@ class EyeTracker:
         # ====================================================
 
         return {
-            "timestamp": timestamp,
+            "timestamp": float(timestamp),
 
             "gaze_x": gaze_x,
             "gaze_y": gaze_y,
 
-            "Eye aspect Ratio": avg_ear,
+            "Eye aspect Ratio": float(avg_ear),
 
-            "blink": is_blink,
+            "blink": int(is_blink),
 
             "saccade_velocity": saccade_velocity,
 
-            "pupil_size": pupil_size,
+            "pupil_size": float(pupil_size),
 
-            "left_pupil_x": left_pupil_x,
-            "left_pupil_y": left_pupil_y,
-            "left_pupil_diameter": left_pupil_diameter,
+            "left_pupil_x": float(left_pupil_x),
+            "left_pupil_y": float(left_pupil_y),
+            "left_pupil_diameter": float(
+                left_pupil_diameter
+            ),
 
-            "right_pupil_x": right_pupil_x,
-            "right_pupil_y": right_pupil_y,
-            "right_pupil_diameter": right_pupil_diameter,
+            "right_pupil_x": float(right_pupil_x),
+            "right_pupil_y": float(right_pupil_y),
+            "right_pupil_diameter": float(
+                right_pupil_diameter
+            ),
 
-            "PoR_binocular_x": por_x,
-            "PoR_binocular_y": por_y,
+            "PoR_binocular_x": float(por_x),
+            "PoR_binocular_y": float(por_y),
 
-            "Point of Regard Right X": right_pupil_x,
-            "Point of Regard Right Y": right_pupil_y,
+            "Point of Regard Right X": float(
+                right_pupil_x
+            ),
+            "Point of Regard Right Y": float(
+                right_pupil_y
+            ),
 
-            "Point of Regard Left X": left_pupil_x,
-            "Point of Regard Left Y": left_pupil_y,
+            "Point of Regard Left X": float(
+                left_pupil_x
+            ),
+            "Point of Regard Left Y": float(
+                left_pupil_y
+            ),
 
             "Category Binocular": "BINOCULAR",
 
             "Index Binocular":
                 len(self.gaze_history) - 1,
 
-            "left_ear": left_ear,
-            "right_ear": right_ear
+            # Información de depuración.
+            "left_ear": float(left_ear),
+            "right_ear": float(right_ear)
         }
 
     # ========================================================
-    # DIBUJO DE LANDMARKS
+    # DEBUG DRAW
     # ========================================================
 
     def draw_debug(self, frame):
         """
-        Dibuja los landmarks oculares del último frame procesado.
+        Dibuja los landmarks oculares del último frame
+        procesado.
 
         No vuelve a ejecutar MediaPipe.
         """
 
-        if self.last_landmarks is None:
+        if (
+            frame is None
+            or self.last_landmarks is None
+        ):
             return frame
 
-        height, width, _ = frame.shape
+        output = frame.copy()
 
-        for index in self.LEFT_EYE + self.RIGHT_EYE:
+        height, width, _ = output.shape
+
+        for index in (
+            self.LEFT_EYE
+            +
+            self.RIGHT_EYE
+        ):
 
             x = int(
-                self.last_landmarks[index].x * width
+                self.last_landmarks[index].x
+                *
+                width
             )
 
             y = int(
-                self.last_landmarks[index].y * height
+                self.last_landmarks[index].y
+                *
+                height
             )
 
             cv2.circle(
-                frame,
+                output,
                 (x, y),
                 2,
                 (0, 255, 0),
                 -1
             )
 
-        return frame
+        return output
 
     # ========================================================
-    # CERRAR MEDIAPIPE
+    # CERRAR
     # ========================================================
 
     def close(self):
-        """Libera los recursos de MediaPipe."""
+        """
+        Libera los recursos de MediaPipe.
+        """
 
-        if self.face_landmarker is not None:
-            self.face_landmarker.close()
+        if self.face_mesh is not None:
+            self.face_mesh.close()
+            self.face_mesh = None

@@ -4,6 +4,7 @@ from collections import deque
 
 import cv2
 import numpy as np
+import tensorflow as tf
 
 from recording import open_camera
 from eye_tracking import EyeTracker
@@ -13,147 +14,101 @@ from eye_tracking import EyeTracker
 # CONFIGURACIÓN
 # ============================================================
 
-# Índice utilizado únicamente como fallback
-# cuando se utiliza una cámara USB.
-CAMERA_INDEX = int(
-    os.getenv("CAMERA_INDEX", "0")
-)
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
 
-CAMERA_WIDTH = int(
-    os.getenv("CAMERA_WIDTH", "640")
-)
+CAMERA_WIDTH = int(os.getenv("CAMERA_WIDTH", "640"))
+CAMERA_HEIGHT = int(os.getenv("CAMERA_HEIGHT", "480"))
+CAMERA_FPS = int(os.getenv("CAMERA_FPS", "30"))
 
-CAMERA_HEIGHT = int(
-    os.getenv("CAMERA_HEIGHT", "480")
-)
-
-CAMERA_FPS = int(
-    os.getenv("CAMERA_FPS", "30")
-)
-
-# El LSTM original fue entrenado con 300 muestras.
+# El modelo fue entrenado con ventanas de 300 muestras.
 WINDOW_SIZE = 300
 
-# Realizar una predicción cada cierto número de muestras.
-# No es necesario ejecutar el modelo en cada frame.
+# Ejecutar una nueva predicción cada N muestras.
 PREDICT_EVERY = 15
 
-# Número de predicciones recientes utilizadas para
-# estabilizar visualmente el resultado.
+# Número de predicciones consecutivas utilizadas para suavizar
+# el resultado mostrado.
 PREDICTION_SMOOTHING = 5
 
-MODELS_DIR = os.getenv(
-    "MODELS_DIR",
-    "saved_models"
-)
+# Umbrales de clasificación.
+# > 0.60  -> Parkinson
+# < 0.40  -> Control
+# entre ambos -> Incertidumbre
+PARKINSON_THRESHOLD = 0.60
+CONTROL_THRESHOLD = 0.40
 
-MODEL_TIMESTAMP = os.getenv(
-    "MODEL_TIMESTAMP",
-    ""
-)
+MODELS_DIR = "saved_models"
+
+# Si se deja vacío, se selecciona automáticamente el .keras
+# más reciente.
+MODEL_TIMESTAMP = os.getenv("MODEL_TIMESTAMP", "")
 
 
 # ============================================================
-# CARGAR MODELO LSTM
+# CARGA DEL MODELO
 # ============================================================
 
-def load_lstm_model(
-    models_dir=MODELS_DIR,
-    timestamp=MODEL_TIMESTAMP
-):
+def load_lstm_model():
     """
-    Carga el modelo LSTM más reciente disponible.
+    Carga el modelo LSTM de Keras.
 
-    El modelo original utiliza:
+    Si MODEL_TIMESTAMP está definido, intenta cargar
+    específicamente ese modelo.
 
-        gaze_x
-        gaze_y
-        saccade_velocity
-        pupil_size
-        blink_bin
+    Ejemplo:
 
-    con una secuencia de 300 muestras.
+        MODEL_TIMESTAMP=20260930_104209
+
+    Si está vacío, selecciona el archivo .keras más reciente
+    dentro de saved_models/.
     """
 
-    try:
-
-        import tensorflow as tf
-
-    except ImportError:
-
-        print(
-            "[WARNING] TensorFlow is not installed."
+    if not os.path.isdir(MODELS_DIR):
+        raise FileNotFoundError(
+            f"No existe el directorio de modelos: {MODELS_DIR}"
         )
 
-        return None
+    model_files = [
+        os.path.join(MODELS_DIR, filename)
+        for filename in os.listdir(MODELS_DIR)
+        if filename.endswith(".keras")
+    ]
 
-    if not os.path.isdir(models_dir):
-
-        print(
-            f"[WARNING] Models directory not found: "
-            f"{models_dir}"
+    if not model_files:
+        raise FileNotFoundError(
+            f"No se encontraron modelos .keras en '{MODELS_DIR}'"
         )
-
-        return None
 
     # --------------------------------------------------------
-    # Buscar archivos LSTM
+    # Modelo específico
     # --------------------------------------------------------
 
-    if timestamp:
+    if MODEL_TIMESTAMP:
 
-        model_filename = (
-            f"lstm_{timestamp}.keras"
-        )
+        matching = [
+            path
+            for path in model_files
+            if MODEL_TIMESTAMP in os.path.basename(path)
+        ]
 
-        model_path = os.path.join(
-            models_dir,
-            model_filename
-        )
-
-        if not os.path.exists(model_path):
-
-            print(
-                f"[WARNING] Requested model not found: "
-                f"{model_path}"
+        if not matching:
+            raise FileNotFoundError(
+                f"No se encontró un modelo con timestamp "
+                f"'{MODEL_TIMESTAMP}'"
             )
 
-            return None
+        model_path = sorted(matching)[-1]
+
+    # --------------------------------------------------------
+    # Modelo más reciente
+    # --------------------------------------------------------
 
     else:
 
-        model_files = [
-
-            filename
-
-            for filename in os.listdir(models_dir)
-
-            if (
-                filename.startswith("lstm_")
-                and filename.endswith(".keras")
-            )
-        ]
-
-        if not model_files:
-
-            print(
-                "[WARNING] No LSTM models found."
-            )
-
-            return None
-
-        # Los nombres contienen timestamp,
-        # por lo que el orden lexicográfico funciona.
-        model_files.sort(reverse=True)
-
-        model_path = os.path.join(
-            models_dir,
-            model_files[0]
+        model_path = max(
+            model_files,
+            key=os.path.getmtime
         )
-
-    # --------------------------------------------------------
-    # Cargar modelo
-    # --------------------------------------------------------
 
     print(
         f"[MODEL] Loading LSTM: {model_path}"
@@ -162,20 +117,18 @@ def load_lstm_model(
     try:
 
         model = tf.keras.models.load_model(
-            model_path
+            model_path,
+            compile=False
         )
 
     except Exception as error:
 
-        print(
-            f"[ERROR] Could not load LSTM model: "
-            f"{error}"
-        )
-
-        return None
+        raise RuntimeError(
+            f"Could not load model '{model_path}': {error}"
+        ) from error
 
     # --------------------------------------------------------
-    # Verificar forma esperada
+    # Validación de arquitectura
     # --------------------------------------------------------
 
     print(
@@ -186,168 +139,187 @@ def load_lstm_model(
         f"[MODEL] Output shape: {model.output_shape}"
     )
 
-    expected_shape = (
-        None,
-        WINDOW_SIZE,
-        5
+    expected_shape = (None, WINDOW_SIZE, 5)
+
+    if tuple(model.input_shape) != expected_shape:
+
+        raise ValueError(
+            "Modelo incompatible.\n"
+            f"Esperado: {expected_shape}\n"
+            f"Encontrado: {model.input_shape}"
+        )
+
+    print(
+        "[MODEL] LSTM loaded successfully."
     )
-
-    if model.input_shape != expected_shape:
-
-        print(
-            "[WARNING] The loaded model does not have "
-            f"the expected input shape {expected_shape}."
-        )
-
-        print(
-            "[WARNING] Real-time inference will continue, "
-            "but compatibility should be checked."
-        )
-
-    print("[MODEL] LSTM loaded successfully.")
 
     return model
 
 
 # ============================================================
-# PREPARAR SECUENCIA PARA LSTM
+# CONSTRUCCIÓN DE LA SECUENCIA PARA EL LSTM
 # ============================================================
 
-def build_lstm_input(buffer):
+def build_lstm_input(feature_buffer):
     """
-    Convierte las últimas 300 métricas en el formato
-    esperado por el LSTM.
+    Convierte las 300 métricas obtenidas por EyeTracker
+    en el tensor esperado por el LSTM.
 
-    Orden de features:
+    Features:
 
-        1. gaze_x
-        2. gaze_y
-        3. saccade_velocity
-        4. pupil_size
-        5. blink_bin
+        0 -> gaze_x
+        1 -> gaze_y
+        2 -> saccade_velocity
+        3 -> pupil_size
+        4 -> blink
+
+    Resultado:
+
+        (1, 300, 5)
     """
+
+    if len(feature_buffer) != WINDOW_SIZE:
+        raise ValueError(
+            f"Se requieren exactamente {WINDOW_SIZE} muestras. "
+            f"Hay {len(feature_buffer)}."
+        )
 
     sequence = []
 
-    for metrics in buffer:
+    for metrics in feature_buffer:
 
-        blink_bin = (
-            1
+        blink_value = (
+            1.0
             if metrics["blink"] != 0
-            else 0
+            else 0.0
         )
 
-        sequence.append(
-            [
-                metrics["gaze_x"],
-                metrics["gaze_y"],
-                metrics["saccade_velocity"],
-                metrics["pupil_size"],
-                blink_bin
-            ]
-        )
+        sequence.append([
+            float(metrics["gaze_x"]),
+            float(metrics["gaze_y"]),
+            float(metrics["saccade_velocity"]),
+            float(metrics["pupil_size"]),
+            blink_value
+        ])
 
-    sequence = np.asarray(
+    array = np.asarray(
         sequence,
         dtype=np.float32
     )
 
-    # Esperamos exactamente:
-    #
-    # (300, 5)
-
-    if sequence.shape != (
+    expected_shape = (
         WINDOW_SIZE,
         5
-    ):
+    )
+
+    if array.shape != expected_shape:
 
         raise ValueError(
-            "Invalid LSTM sequence shape: "
-            f"{sequence.shape}"
+            f"Forma incorrecta de secuencia: {array.shape}. "
+            f"Esperada: {expected_shape}"
         )
 
-    # Añadir dimensión del batch:
-    #
+    # Añadir dimensión batch.
+    array = np.expand_dims(
+        array,
+        axis=0
+    )
+
+    # Resultado:
     # (1, 300, 5)
 
-    return sequence[np.newaxis, :, :]
+    return array
 
 
 # ============================================================
 # PREDICCIÓN
 # ============================================================
 
-def predict_parkinsons(
-    model,
-    buffer
-):
+def predict_parkinsons(model, feature_buffer):
     """
-    Ejecuta una predicción sobre una ventana de 300 muestras.
+    Realiza una predicción.
 
-    La salida sigmoid del modelo se interpreta como el
-    score asociado a la clase Parkinson (1), de acuerdo con
-    el entrenamiento original.
+    Devuelve una probabilidad entre 0 y 1.
+
+    0 -> Control
+    1 -> Parkinson
     """
 
-    if model is None:
-        return None
+    model_input = build_lstm_input(
+        feature_buffer
+    )
 
-    try:
+    prediction = model.predict(
+        model_input,
+        verbose=0
+    )
 
-        X = build_lstm_input(
-            buffer
-        )
+    score = float(
+        np.asarray(prediction).reshape(-1)[0]
+    )
 
-        prediction = model.predict(
-            X,
-            verbose=0
-        )[0][0]
+    score = float(
+        np.clip(score, 0.0, 1.0)
+    )
 
-        prediction = float(
-            np.clip(
-                prediction,
-                0.0,
-                1.0
-            )
-        )
-
-        return prediction
-
-    except Exception as error:
-
-        print(
-            f"[ERROR] Prediction failed: {error}"
-        )
-
-        return None
+    return score
 
 
 # ============================================================
-# INTERPRETACIÓN DEL SCORE
+# CLASIFICACIÓN
 # ============================================================
 
 def classify_score(score):
     """
-    Utiliza los mismos umbrales del repositorio original:
-
-        > 0.60 -> Parkinson
-        < 0.40 -> No Parkinson
-        0.40-0.60 -> Uncertain
+    Convierte la probabilidad en una categoría visual.
     """
 
-    if score is None:
-
-        return "MODEL UNAVAILABLE"
-
-    if score > 0.60:
+    if score >= PARKINSON_THRESHOLD:
 
         return "PARKINSON SCORE HIGH"
 
-    if score < 0.40:
+    if score <= CONTROL_THRESHOLD:
 
         return "CONTROL SCORE HIGH"
 
     return "UNCERTAIN"
+
+
+# ============================================================
+# FPS
+# ============================================================
+
+class FPSCounter:
+
+    def __init__(self, averaging_window=30):
+
+        self.timestamps = deque(
+            maxlen=averaging_window
+        )
+
+    def update(self):
+
+        self.timestamps.append(
+            time.perf_counter()
+        )
+
+    def get_fps(self):
+
+        if len(self.timestamps) < 2:
+            return 0.0
+
+        elapsed = (
+            self.timestamps[-1]
+            - self.timestamps[0]
+        )
+
+        if elapsed <= 0:
+            return 0.0
+
+        return (
+            (len(self.timestamps) - 1)
+            / elapsed
+        )
 
 
 # ============================================================
@@ -356,62 +328,37 @@ def classify_score(score):
 
 def draw_overlay(
     frame,
-    tracking_active,
     metrics,
-    sample_count,
-    prediction,
+    feature_buffer,
+    current_score,
+    classification,
     fps
 ):
     """
-    Dibuja información del sistema sobre el feed.
+    Dibuja información de seguimiento e inferencia.
     """
 
-    height, width = frame.shape[:2]
+    output = frame.copy()
 
     # --------------------------------------------------------
-    # Panel de información
+    # Información de tracking
     # --------------------------------------------------------
 
-    panel_height = 185
+    if metrics is None:
 
-    overlay = frame.copy()
+        tracking_text = "EYE TRACKING: NO FACE"
 
-    cv2.rectangle(
-        overlay,
-        (0, 0),
-        (width, panel_height),
-        (0, 0, 0),
-        -1
-    )
+    else:
 
-    # Transparencia.
-    frame[:] = cv2.addWeighted(
-        overlay,
-        0.65,
-        frame,
-        0.35,
-        0
-    )
-
-    # --------------------------------------------------------
-    # Estado de tracking
-    # --------------------------------------------------------
-
-    tracking_text = (
-        "TRACKING: OK"
-        if tracking_active
-        else "TRACKING: NO FACE"
-    )
+        tracking_text = "EYE TRACKING: ACTIVE"
 
     cv2.putText(
-        frame,
+        output,
         tracking_text,
-        (15, 30),
+        (20, 30),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 0)
-        if tracking_active
-        else (0, 0, 255),
+        0.65,
+        (0, 255, 0) if metrics is not None else (0, 0, 255),
         2
     )
 
@@ -420,9 +367,9 @@ def draw_overlay(
     # --------------------------------------------------------
 
     cv2.putText(
-        frame,
+        output,
         f"FPS: {fps:.1f}",
-        (15, 60),
+        (20, 60),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
         (255, 255, 255),
@@ -434,9 +381,9 @@ def draw_overlay(
     # --------------------------------------------------------
 
     cv2.putText(
-        frame,
-        f"SAMPLES: {sample_count}/{WINDOW_SIZE}",
-        (15, 90),
+        output,
+        f"SAMPLES: {len(feature_buffer)}/{WINDOW_SIZE}",
+        (20, 90),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.6,
         (255, 255, 255),
@@ -449,110 +396,188 @@ def draw_overlay(
 
     if metrics is not None:
 
+        gaze_x = metrics["gaze_x"]
+        gaze_y = metrics["gaze_y"]
+        velocity = metrics["saccade_velocity"]
+        pupil = metrics["pupil_size"]
+        blink = metrics["blink"]
+
         cv2.putText(
-            frame,
-            f"GAZE: "
-            f"{metrics['gaze_x']:.1f}, "
-            f"{metrics['gaze_y']:.1f}",
-            (15, 120),
+            output,
+            f"Gaze: ({gaze_x:.1f}, {gaze_y:.1f})",
+            (20, 125),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
             (255, 255, 255),
-            1
+            2
         )
 
         cv2.putText(
-            frame,
-            f"BLINK: {metrics['blink']}   "
-            f"VELOCITY: "
-            f"{metrics['saccade_velocity']:.1f}",
-            (15, 145),
+            output,
+            f"Velocity: {velocity:.1f}",
+            (20, 155),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
             (255, 255, 255),
-            1
+            2
+        )
+
+        cv2.putText(
+            output,
+            f"Pupil proxy: {pupil:.1f}",
+            (20, 185),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2
+        )
+
+        cv2.putText(
+            output,
+            f"Blink: {blink}",
+            (20, 215),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2
         )
 
     # --------------------------------------------------------
     # Modelo
     # --------------------------------------------------------
 
-    if prediction is None:
+    if current_score is None:
 
-        model_text = (
-            "MODEL: WAITING FOR DATA"
-        )
+        score_text = "MODEL: WAITING FOR 300 SAMPLES"
 
     else:
 
-        model_text = (
-            f"MODEL SCORE: "
-            f"{prediction * 100:.1f}%"
+        score_text = (
+            f"PARKINSON SCORE: "
+            f"{current_score:.3f}"
         )
 
     cv2.putText(
-        frame,
-        model_text,
-        (15, 175),
+        output,
+        score_text,
+        (20, 255),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.65,
-        (0, 255, 255),
+        (255, 255, 255),
         2
     )
 
-    return frame
+    # --------------------------------------------------------
+    # Clasificación
+    # --------------------------------------------------------
+
+    if classification is None:
+
+        classification_text = "CLASSIFICATION: WAITING"
+
+    else:
+
+        classification_text = (
+            f"CLASSIFICATION: {classification}"
+        )
+
+    cv2.putText(
+        output,
+        classification_text,
+        (20, 290),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.65,
+        (255, 255, 255),
+        2
+    )
+
+    # --------------------------------------------------------
+    # Instrucción
+    # --------------------------------------------------------
+
+    cv2.putText(
+        output,
+        "Press Q to exit",
+        (20, output.shape[0] - 20),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2
+    )
+
+    return output
 
 
 # ============================================================
-# PROGRAMA PRINCIPAL
+# MAIN
 # ============================================================
 
 def main():
 
     print("=" * 60)
-    print(
-        "PARKINSON EYE TRACKING - REAL TIME"
-    )
+    print("PARKINSON EYE TRACKING - REAL TIME")
     print("=" * 60)
 
-    # --------------------------------------------------------
-    # Cámara
-    # --------------------------------------------------------
-
-    camera = open_camera(
-        width=CAMERA_WIDTH,
-        height=CAMERA_HEIGHT,
-        fps=CAMERA_FPS,
-        camera_index=CAMERA_INDEX
-    )
+    camera = None
+    tracker = None
 
     # --------------------------------------------------------
-    # Eye tracker
+    # Cargar modelo
     # --------------------------------------------------------
 
-    tracker = EyeTracker()
+    try:
 
-    # --------------------------------------------------------
-    # Modelo
-    # --------------------------------------------------------
+        model = load_lstm_model()
 
-    model = load_lstm_model()
-
-    if model is None:
+    except Exception as error:
 
         print(
-            "[WARNING] Real-time model inference "
-            "is disabled."
+            f"[MODEL ERROR] {error}"
         )
 
-    else:
-
-        print(
-            "[MODEL] Real-time inference enabled."
-        )
+        return
 
     # --------------------------------------------------------
-    # Buffer
+    # Abrir cámara
+    # --------------------------------------------------------
+
+    try:
+
+        camera = open_camera(
+            width=CAMERA_WIDTH,
+            height=CAMERA_HEIGHT,
+            fps=CAMERA_FPS,
+            camera_index=CAMERA_INDEX
+        )
+
+    except Exception as error:
+
+        print(
+            f"[CAMERA ERROR] {error}"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # Inicializar EyeTracker
+    # --------------------------------------------------------
+
+    try:
+
+        tracker = EyeTracker()
+
+    except Exception as error:
+
+        print(
+            f"[EYE TRACKING ERROR] {error}"
+        )
+
+        camera.release()
+
+        return
+
+    # --------------------------------------------------------
+    # Estado
     # --------------------------------------------------------
 
     feature_buffer = deque(
@@ -563,13 +588,27 @@ def main():
         maxlen=PREDICTION_SMOOTHING
     )
 
-    current_prediction = None
+    current_score = None
+    classification = None
 
-    frame_count = 0
+    sample_counter = 0
 
-    last_prediction_sample = 0
+    fps_counter = FPSCounter()
 
+    # Timestamp relativo al inicio de la ejecución.
     start_time = time.perf_counter()
+
+    print(
+        "[MODEL] Real-time inference enabled."
+    )
+
+    print(
+        "[SYSTEM] Starting real-time processing..."
+    )
+
+    # --------------------------------------------------------
+    # Bucle principal
+    # --------------------------------------------------------
 
     try:
 
@@ -577,19 +616,15 @@ def main():
 
             success, frame = camera.read()
 
-            if not success:
+            if not success or frame is None:
 
                 print(
-                    "[ERROR] Failed to read camera frame."
+                    "[CAMERA] Frame capture failed."
                 )
 
                 break
 
-            frame_count += 1
-
-            # ------------------------------------------------
-            # Timestamp REAL de captura/procesamiento.
-            # ------------------------------------------------
+            fps_counter.update()
 
             timestamp = (
                 time.perf_counter()
@@ -597,7 +632,7 @@ def main():
             )
 
             # ------------------------------------------------
-            # Eye tracking
+            # Eye Tracking
             # ------------------------------------------------
 
             metrics = tracker.process_frame(
@@ -605,12 +640,8 @@ def main():
                 timestamp
             )
 
-            tracking_active = (
-                metrics is not None
-            )
-
             # ------------------------------------------------
-            # Guardar métricas
+            # Agregar solamente frames con rostro válido
             # ------------------------------------------------
 
             if metrics is not None:
@@ -619,130 +650,134 @@ def main():
                     metrics
                 )
 
-            # ------------------------------------------------
-            # Predicción
-            # ------------------------------------------------
+                sample_counter += 1
 
-            if (
-                model is not None
-                and len(feature_buffer)
-                == WINDOW_SIZE
-                and (
-                    len(feature_buffer)
-                    - last_prediction_sample
-                    >= PREDICT_EVERY
-                )
-            ):
+                # ------------------------------------------------
+                # Primera predicción:
+                # cuando existen 300 muestras.
+                #
+                # Posteriormente cada 15 muestras.
+                # ------------------------------------------------
 
-                prediction = predict_parkinsons(
-                    model,
-                    feature_buffer
-                )
-
-                if prediction is not None:
-
-                    prediction_history.append(
-                        prediction
-                    )
-
-                    # Promedio de las últimas
-                    # predicciones para reducir
-                    # oscilaciones visuales.
-
-                    current_prediction = float(
-                        np.mean(
-                            prediction_history
+                if (
+                    len(feature_buffer) == WINDOW_SIZE
+                    and (
+                        sample_counter == WINDOW_SIZE
+                        or
+                        (
+                            sample_counter > WINDOW_SIZE
+                            and
+                            (
+                                sample_counter
+                                - WINDOW_SIZE
+                            ) % PREDICT_EVERY == 0
                         )
                     )
+                ):
 
-                last_prediction_sample = len(
-                    feature_buffer
-                )
+                    try:
 
-            # ------------------------------------------------
-            # FPS
-            # ------------------------------------------------
+                        score = predict_parkinsons(
+                            model,
+                            feature_buffer
+                        )
 
-            elapsed = (
-                time.perf_counter()
-                - start_time
-            )
+                        prediction_history.append(
+                            score
+                        )
 
-            current_fps = (
-                frame_count / elapsed
-                if elapsed > 0
-                else 0
-            )
+                        # ------------------------------------------------
+                        # Suavizado temporal
+                        # ------------------------------------------------
+
+                        current_score = float(
+                            np.mean(
+                                prediction_history
+                            )
+                        )
+
+                        classification = classify_score(
+                            current_score
+                        )
+
+                        print(
+                            f"[MODEL] Score: "
+                            f"{current_score:.4f} | "
+                            f"{classification}"
+                        )
+
+                    except Exception as error:
+
+                        print(
+                            f"[MODEL ERROR] Prediction failed: {error}"
+                        )
 
             # ------------------------------------------------
             # Overlay
             # ------------------------------------------------
 
-            draw_overlay(
-                frame,
-                tracking_active,
-                metrics,
-                len(feature_buffer),
-                current_prediction,
-                current_fps
+            output = draw_overlay(
+                frame=frame,
+                metrics=metrics,
+                feature_buffer=feature_buffer,
+                current_score=current_score,
+                classification=classification,
+                fps=fps_counter.get_fps()
             )
-
-            # ------------------------------------------------
-            # Resultado de clasificación
-            # ------------------------------------------------
-
-            if current_prediction is not None:
-
-                result = classify_score(
-                    current_prediction
-                )
-
-                cv2.putText(
-                    frame,
-                    result,
-                    (
-                        15,
-                        CAMERA_HEIGHT - 25
-                    ),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.75,
-                    (0, 255, 255),
-                    2
-                )
-
-            # ------------------------------------------------
-            # Mostrar
-            # ------------------------------------------------
 
             cv2.imshow(
-                "Parkinson Eye Tracking - REAL TIME",
-                frame
+                "Parkinson Eye Tracking - Real Time",
+                output
             )
 
             # ------------------------------------------------
-            # Tecla Q
+            # Salir con Q
             # ------------------------------------------------
 
             key = cv2.waitKey(1) & 0xFF
 
             if key == ord("q"):
-
                 print(
-                    "[SYSTEM] Stopping..."
+                    "[SYSTEM] Q pressed. Exiting..."
                 )
-
                 break
+
+    except KeyboardInterrupt:
+
+        print(
+            "\n[SYSTEM] Interrupted by user."
+        )
 
     finally:
 
-        camera.release()
-        tracker.close()
+        print(
+            "[SYSTEM] Releasing resources..."
+        )
+
+        if camera is not None:
+
+            try:
+                camera.release()
+            except Exception:
+                pass
+
+        if tracker is not None:
+
+            try:
+                tracker.close()
+            except Exception:
+                pass
+
         cv2.destroyAllWindows()
 
-    print(
-        "[SYSTEM] Real-time detection stopped."
-    )
+        print(
+            "[SYSTEM] Shutdown complete."
+        )
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
     main()

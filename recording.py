@@ -1,606 +1,441 @@
 import cv2
 import os
-import sys
+import shutil
+import subprocess
 import time
 
-
-# ============================================================
-# CONFIGURACIÓN GENERAL
-# ============================================================
 
 DEFAULT_WIDTH = 640
 DEFAULT_HEIGHT = 480
 DEFAULT_FPS = 30
-DEFAULT_DURATION = 60
 
 
 # ============================================================
-# CÁMARA USB
+# USB CAMERA
 # ============================================================
 
 def open_usb_camera(
-        camera_index=0,
-        width=DEFAULT_WIDTH,
-        height=DEFAULT_HEIGHT,
-        fps=DEFAULT_FPS):
-    """
-    Abre una cámara USB mediante OpenCV.
+    camera_index=0,
+    width=DEFAULT_WIDTH,
+    height=DEFAULT_HEIGHT,
+    fps=DEFAULT_FPS
+):
+    print(f"[CAMERA] Trying USB camera index {camera_index}...")
 
-    Se utiliza como cámara secundaria/fallback cuando
-    la Camera Module de Raspberry Pi no puede abrirse.
-    """
-
-    print(
-        f"[CAMERA] Trying USB camera with index "
-        f"{camera_index}..."
-    )
-
-    if os.name == "nt":
-
-        camera = cv2.VideoCapture(
-            camera_index,
-            cv2.CAP_DSHOW
-        )
-
-        if not camera.isOpened():
-
-            print(
-                "[WARNING] CAP_DSHOW failed. "
-                "Trying default backend..."
-            )
-
-            camera.release()
-
-            camera = cv2.VideoCapture(
-                camera_index
-            )
-
-    else:
-
-        camera = cv2.VideoCapture(
-            camera_index
-        )
+    camera = cv2.VideoCapture(camera_index)
 
     if not camera.isOpened():
-
+        camera.release()
         raise RuntimeError(
-            f"Could not open USB camera "
-            f"with index {camera_index}"
+            f"Could not open USB camera index {camera_index}"
         )
 
-    camera.set(
-        cv2.CAP_PROP_FRAME_WIDTH,
-        width
-    )
+    camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+    camera.set(cv2.CAP_PROP_FPS, fps)
 
-    camera.set(
-        cv2.CAP_PROP_FRAME_HEIGHT,
-        height
-    )
+    # Confirmar que realmente podemos obtener un frame.
+    success, frame = camera.read()
 
-    camera.set(
-        cv2.CAP_PROP_FPS,
-        fps
-    )
-
-    actual_width = int(
-        camera.get(
-            cv2.CAP_PROP_FRAME_WIDTH
+    if not success or frame is None:
+        camera.release()
+        raise RuntimeError(
+            f"USB camera index {camera_index} opened but returned no frame"
         )
-    )
 
-    actual_height = int(
-        camera.get(
-            cv2.CAP_PROP_FRAME_HEIGHT
-        )
-    )
-
-    actual_fps = camera.get(
-        cv2.CAP_PROP_FPS
-    )
-
-    if actual_fps <= 0:
-
-        actual_fps = fps
+    actual_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+    actual_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    actual_fps = camera.get(cv2.CAP_PROP_FPS)
 
     print(
-        f"[CAMERA] USB camera opened: "
-        f"{actual_width}x{actual_height} "
-        f"@ {actual_fps:.2f} FPS"
+        f"[CAMERA] USB Camera opened: "
+        f"{actual_width}x{actual_height} @ {actual_fps:.1f} FPS"
     )
 
     return camera
 
 
 # ============================================================
-# ADAPTADOR PARA CÁMARA RASPBERRY PI
+# RASPBERRY PI CAMERA THROUGH RPICAM-VID
 # ============================================================
 
-class RaspberryPiCamera:
+class RpiCamVideo:
     """
-    Adaptador que proporciona una interfaz similar a
-    cv2.VideoCapture.
+    Captura la cámara oficial de Raspberry Pi usando rpicam-vid.
 
-    Esto permite utilizar Picamera2 sin tener que cambiar
-    el resto del sistema.
+    rpicam-vid genera un stream MJPEG y lo escribe directamente
+    en stdout. Python recibe los JPEG, los decodifica con OpenCV
+    y expone la interfaz:
 
-    Métodos principales:
-
-        read()
-        release()
+        success, frame = camera.read()
     """
 
     def __init__(
-            self,
-            width=DEFAULT_WIDTH,
-            height=DEFAULT_HEIGHT,
-            fps=DEFAULT_FPS):
-
-        from picamera2 import Picamera2
-
-        print(
-            "[CAMERA] Initializing Raspberry Pi Camera "
-            "with Picamera2..."
-        )
-
-        self.picam2 = Picamera2()
-
-        config = self.picam2.create_video_configuration(
-            main={
-                "size": (
-                    width,
-                    height
-                ),
-                "format": "RGB888"
-            },
-            controls={
-                "FrameRate": fps
-            }
-        )
-
-        self.picam2.configure(
-            config
-        )
-
-        self.picam2.start()
-
-        # Dar tiempo para que la cámara estabilice
-        # exposición y balance de blancos.
-        time.sleep(2)
-
+        self,
+        width=DEFAULT_WIDTH,
+        height=DEFAULT_HEIGHT,
+        fps=DEFAULT_FPS
+    ):
         self.width = width
         self.height = height
         self.fps = fps
 
+        self.process = None
+        self.buffer = bytearray()
+
+        print("[CAMERA] Initializing Raspberry Pi Camera with rpicam-vid...")
+
+        rpicam_path = shutil.which("rpicam-vid")
+
+        if rpicam_path is None:
+            raise RuntimeError(
+                "rpicam-vid was not found in PATH"
+            )
+
+        command = [
+            rpicam_path,
+            "-n",
+            "-t", "0",
+            "--codec", "mjpeg",
+            "--width", str(width),
+            "--height", str(height),
+            "--framerate", str(fps),
+            "--quality", "80",
+            "--flush",
+            "-o", "-"
+        ]
+
+        print("[CAMERA] Command:", " ".join(command))
+
+        try:
+            self.process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0
+            )
+        except Exception as error:
+            self.process = None
+            raise RuntimeError(
+                f"Could not start rpicam-vid: {error}"
+            ) from error
+
+        time.sleep(1.0)
+
+        if self.process.poll() is not None:
+            return_code = self.process.returncode
+            self.release()
+
+            raise RuntimeError(
+                f"rpicam-vid exited immediately "
+                f"with return code {return_code}"
+            )
+
         print(
-            f"[CAMERA] Raspberry Pi Camera opened: "
+            f"[CAMERA] Raspberry Pi Camera selected: "
             f"{width}x{height} @ {fps} FPS"
         )
 
     def read(self):
         """
-        Captura un frame.
+        Lee el siguiente JPEG del stream MJPEG.
 
         Devuelve:
-
-            (True, frame)
-
-        de manera compatible con cv2.VideoCapture.
+            (True, frame) si hay un frame válido.
+            (False, None) si la cámara dejó de producir datos.
         """
 
-        try:
+        if self.process is None or self.process.stdout is None:
+            return False, None
 
-            frame = self.picam2.capture_array(
-                "main"
-            )
+        while True:
 
-            if frame is None:
+            # ------------------------------------------------
+            # Buscar inicio de JPEG.
+            # ------------------------------------------------
+            start = self.buffer.find(b"\xff\xd8")
 
+            if start >= 0:
+
+                # Descartar cualquier basura anterior al JPEG.
+                if start > 0:
+                    del self.buffer[:start]
+
+                # Buscar final del JPEG.
+                end = self.buffer.find(b"\xff\xd9", 2)
+
+                if end >= 0:
+
+                    jpeg_data = bytes(
+                        self.buffer[:end + 2]
+                    )
+
+                    del self.buffer[:end + 2]
+
+                    frame = cv2.imdecode(
+                        __import__("numpy").frombuffer(
+                            jpeg_data,
+                            dtype=__import__("numpy").uint8
+                        ),
+                        cv2.IMREAD_COLOR
+                    )
+
+                    if frame is not None:
+                        return True, frame
+
+                    # JPEG inválido; buscar siguiente.
+                    continue
+
+            # ------------------------------------------------
+            # Leer más datos desde rpicam-vid.
+            # ------------------------------------------------
+            chunk = self.process.stdout.read(65536)
+
+            if not chunk:
                 return False, None
 
-            # Picamera2 entrega RGB888.
-            # OpenCV trabaja habitualmente en BGR.
-            frame = cv2.cvtColor(
-                frame,
-                cv2.COLOR_RGB2BGR
-            )
+            self.buffer.extend(chunk)
 
-            return True, frame
+            # ------------------------------------------------
+            # Protección contra crecimiento anormal.
+            # ------------------------------------------------
+            if len(self.buffer) > 10 * 1024 * 1024:
 
-        except Exception as error:
+                start = self.buffer.find(b"\xff\xd8")
 
-            print(
-                f"[CAMERA] Raspberry frame error: "
-                f"{error}"
-            )
+                if start >= 0:
+                    del self.buffer[:start]
+                else:
+                    self.buffer.clear()
 
-            return False, None
+                if self.process.poll() is not None:
+                    return False, None
 
     def release(self):
         """
-        Detiene y libera Picamera2.
+        Detiene rpicam-vid y libera los recursos.
         """
 
-        try:
-
-            self.picam2.stop()
-
-        except Exception:
-
-            pass
+        if self.process is None:
+            return
 
         try:
 
-            self.picam2.close()
+            if self.process.poll() is None:
+                self.process.terminate()
 
-        except Exception:
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
 
-            pass
+        except Exception as error:
+            print(
+                f"[WARNING] Error stopping rpicam-vid: {error}"
+            )
 
-        print(
-            "[CAMERA] Raspberry Pi Camera released."
-        )
+        finally:
+
+            if self.process.stdout is not None:
+                try:
+                    self.process.stdout.close()
+                except Exception:
+                    pass
+
+            self.process = None
 
 
 # ============================================================
-# APERTURA AUTOMÁTICA DE CÁMARA
+# AUTOMATIC CAMERA SELECTION
 # ============================================================
+
+def open_raspberry_camera(
+    width=DEFAULT_WIDTH,
+    height=DEFAULT_HEIGHT,
+    fps=DEFAULT_FPS
+):
+    """
+    Intenta abrir la cámara oficial utilizando rpicam-vid.
+    """
+
+    camera = RpiCamVideo(
+        width=width,
+        height=height,
+        fps=fps
+    )
+
+    return camera
+
 
 def open_camera(
-        width=DEFAULT_WIDTH,
-        height=DEFAULT_HEIGHT,
-        fps=DEFAULT_FPS,
-        camera_index=0):
+    width=DEFAULT_WIDTH,
+    height=DEFAULT_HEIGHT,
+    fps=DEFAULT_FPS,
+    camera_index=0
+):
     """
-    Abre automáticamente la mejor cámara disponible.
+    Selección automática:
 
-    Prioridad:
+        1. Raspberry Pi Camera mediante rpicam-vid.
+        2. USB Camera mediante OpenCV.
 
-        1. Camera Module oficial de Raspberry Pi
-           utilizando Picamera2.
-
-        2. Cámara USB mediante OpenCV.
-
-    En Windows, Picamera2 normalmente no está disponible,
-    por lo que se utilizará directamente la cámara USB.
-
-    En Raspberry Pi, la Camera Module será la primera opción.
+    Esto permite utilizar el mismo código en la Raspberry
+    y en Windows.
     """
 
-    # ========================================================
-    # 1. INTENTAR RASPBERRY PI CAMERA
-    # ========================================================
+    # --------------------------------------------------------
+    # Intentar cámara oficial
+    # --------------------------------------------------------
 
-    print(
-        "[CAMERA] Trying Raspberry Pi Camera first..."
-    )
+    print("[CAMERA] Trying Raspberry Pi Camera first...")
 
     try:
 
-        camera = RaspberryPiCamera(
+        camera = open_raspberry_camera(
             width=width,
             height=height,
             fps=fps
         )
 
-        print(
-            "[CAMERA] Camera selected: "
-            "Raspberry Pi Camera"
-        )
+        print("[CAMERA] Camera selected: Raspberry Pi Camera")
 
         return camera
 
     except Exception as error:
 
         print(
-            "[WARNING] Raspberry Pi Camera "
-            f"unavailable: {error}"
+            "[WARNING] Raspberry Pi Camera unavailable:"
+        )
+        print(
+            f"[WARNING] {error}"
         )
 
         print(
             "[CAMERA] Falling back to USB camera..."
         )
 
+    # --------------------------------------------------------
+    # Fallback USB
+    # --------------------------------------------------------
 
-    # ========================================================
-    # 2. FALLBACK A USB
-    # ========================================================
+    camera = open_usb_camera(
+        camera_index=camera_index,
+        width=width,
+        height=height,
+        fps=fps
+    )
 
-    try:
+    print("[CAMERA] Camera selected: USB camera")
 
-        camera = open_usb_camera(
-            camera_index=camera_index,
-            width=width,
-            height=height,
-            fps=fps
-        )
-
-        print(
-            "[CAMERA] Camera selected: USB camera"
-        )
-
-        return camera
-
-    except Exception as error:
-
-        raise RuntimeError(
-            "No camera could be opened. "
-            "Tried Raspberry Pi Camera and USB camera. "
-            f"USB error: {error}"
-        )
+    return camera
 
 
 # ============================================================
-# GRABACIÓN
+# OPTIONAL VIDEO RECORDING
 # ============================================================
 
 def record_video(
-        camera,
-        output_path="camera_record.mp4",
-        max_duration=DEFAULT_DURATION,
-        fps=DEFAULT_FPS):
+    camera,
+    output_file="camera_record.mp4",
+    duration=30
+):
     """
-    Captura frames de cualquiera de nuestras cámaras y
-    los guarda como MP4.
+    Función auxiliar para grabar frames a un archivo.
 
-    Actualmente soporta:
-
-        - RaspberryPiCamera
-        - cv2.VideoCapture
+    No forma parte del pipeline de detección en tiempo real.
     """
 
-    print(
-        "[RECORDING] Starting camera capture..."
-    )
-
-    print(
-        "[RECORDING] Press 'q' to stop."
-    )
-
-    # --------------------------------------------------------
-    # Obtener dimensiones
-    # --------------------------------------------------------
-
-    if isinstance(
-        camera,
-        RaspberryPiCamera
-    ):
-
-        frame_width = camera.width
-        frame_height = camera.height
-        actual_fps = camera.fps
-
-    else:
-
-        frame_width = int(
-            camera.get(
-                cv2.CAP_PROP_FRAME_WIDTH
-            )
-        )
-
-        frame_height = int(
-            camera.get(
-                cv2.CAP_PROP_FRAME_HEIGHT
-            )
-        )
-
-        actual_fps = camera.get(
-            cv2.CAP_PROP_FPS
-        )
-
-        if actual_fps <= 0:
-
-            actual_fps = fps
-
-    print(
-        f"[RECORDING] Resolution: "
-        f"{frame_width}x{frame_height}"
-    )
-
-    print(
-        f"[RECORDING] FPS used for recording: "
-        f"{actual_fps:.2f}"
-    )
-
-    # --------------------------------------------------------
-    # VideoWriter
-    # --------------------------------------------------------
-
-    fourcc = cv2.VideoWriter_fourcc(
-        *"mp4v"
-    )
-
-    writer = cv2.VideoWriter(
-        output_path,
-        fourcc,
-        actual_fps,
-        (
-            frame_width,
-            frame_height
-        )
-    )
-
-    if not writer.isOpened():
-
-        camera.release()
-
-        raise RuntimeError(
-            f"Could not create video file: "
-            f"{output_path}"
-        )
+    writer = None
 
     start_time = time.time()
 
-    frame_count = 0
+    frames = 0
 
     try:
 
-        while True:
+        while time.time() - start_time < duration:
 
             success, frame = camera.read()
 
-            if not success:
-
-                print(
-                    "[ERROR] Failed to capture frame."
-                )
-
+            if not success or frame is None:
+                print("[WARNING] Failed to read camera frame")
                 break
 
-            writer.write(
+            height, width = frame.shape[:2]
+
+            if writer is None:
+
+                fourcc = cv2.VideoWriter_fourcc(
+                    *"mp4v"
+                )
+
+                writer = cv2.VideoWriter(
+                    output_file,
+                    fourcc,
+                    DEFAULT_FPS,
+                    (width, height)
+                )
+
+                if not writer.isOpened():
+                    raise RuntimeError(
+                        f"Could not open VideoWriter: {output_file}"
+                    )
+
+            writer.write(frame)
+
+            frames += 1
+
+            cv2.imshow(
+                "Recording",
                 frame
             )
 
-            frame_count += 1
-
-            # ------------------------------------------------
-            # PREVISUALIZACIÓN
-            # ------------------------------------------------
-
-            preview = frame.copy()
-
-            cv2.putText(
-                preview,
-                "CAMERA",
-                (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.8,
-                (0, 255, 0),
-                2
-            )
-
-            elapsed = (
-                time.time()
-                - start_time
-            )
-
-            cv2.putText(
-                preview,
-                f"Time: {elapsed:.1f}s",
-                (10, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2
-            )
-
-            cv2.putText(
-                preview,
-                f"Frames: {frame_count}",
-                (10, 90),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 0),
-                2
-            )
-
-            cv2.imshow(
-                "Parkinson Eye Tracking - Camera",
-                preview
-            )
-
-            # ------------------------------------------------
-            # Q
-            # ------------------------------------------------
-
-            if (
-                cv2.waitKey(1) & 0xFF
-                == ord("q")
-            ):
-
-                print(
-                    "[RECORDING] Stopped by user."
-                )
-
-                break
-
-            # ------------------------------------------------
-            # Duración máxima
-            # ------------------------------------------------
-
-            if elapsed >= max_duration:
-
-                print(
-                    f"[RECORDING] Maximum duration "
-                    f"({max_duration}s) reached."
-                )
-
+            if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
 
     finally:
 
-        camera.release()
-
-        writer.release()
+        if writer is not None:
+            writer.release()
 
         cv2.destroyAllWindows()
 
-    print()
-    print(
-        "[RECORDING] Capture completed."
-    )
+        print(
+            f"[CAMERA] Recording finished: "
+            f"{output_file}"
+        )
 
-    print(
-        f"[RECORDING] Frames captured: "
-        f"{frame_count}"
-    )
-
-    print(
-        f"[RECORDING] Output: {output_path}"
-    )
-
-    return frame_count > 0
+        print(
+            f"[CAMERA] Frames recorded: {frames}"
+        )
 
 
 # ============================================================
-# PROGRAMA PRINCIPAL
+# MAIN
 # ============================================================
 
 def main():
 
     camera_index = int(
-        os.getenv(
-            "CAMERA_INDEX",
-            "0"
-        )
+        os.getenv("CAMERA_INDEX", "0")
     )
 
     width = int(
-        os.getenv(
-            "CAMERA_WIDTH",
-            str(DEFAULT_WIDTH)
-        )
+        os.getenv("CAMERA_WIDTH", str(DEFAULT_WIDTH))
     )
 
     height = int(
-        os.getenv(
-            "CAMERA_HEIGHT",
-            str(DEFAULT_HEIGHT)
-        )
+        os.getenv("CAMERA_HEIGHT", str(DEFAULT_HEIGHT))
     )
 
     fps = int(
-        os.getenv(
-            "CAMERA_FPS",
-            str(DEFAULT_FPS)
-        )
+        os.getenv("CAMERA_FPS", str(DEFAULT_FPS))
     )
 
-    max_duration = int(
-        os.getenv(
-            "MAX_DURATION",
-            str(DEFAULT_DURATION)
-        )
+    duration = int(
+        os.getenv("MAX_DURATION", "30")
     )
-
-    output_file = os.getenv(
-        "OUTPUT_FILE",
-        "camera_record.mp4"
-    )
-
-    # --------------------------------------------------------
-    # Apertura automática
-    # --------------------------------------------------------
 
     camera = open_camera(
         width=width,
@@ -609,22 +444,18 @@ def main():
         camera_index=camera_index
     )
 
-    # --------------------------------------------------------
-    # Grabación
-    # --------------------------------------------------------
+    try:
 
-    success = record_video(
-        camera=camera,
-        output_path=output_file,
-        max_duration=max_duration,
-        fps=fps
-    )
+        record_video(
+            camera,
+            output_file="camera_record.mp4",
+            duration=duration
+        )
 
-    sys.exit(
-        0 if success else 1
-    )
+    finally:
+
+        camera.release()
 
 
 if __name__ == "__main__":
-
     main()
