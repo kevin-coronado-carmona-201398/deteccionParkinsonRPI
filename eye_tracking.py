@@ -1,24 +1,26 @@
 import cv2
 import mediapipe as mp
 import numpy as np
+import os
 
 
 class EyeTracker:
     """
     Procesador de frames para extracción de métricas oculares.
 
-    Esta clase reemplaza la lógica de procesamiento que
-    originalmente estaba contenida dentro de try.py.
+    Compatible con:
+        - Raspberry Pi Camera
+        - cámara USB
+        - archivos de video
 
-    Puede recibir frames provenientes de:
-        - un archivo de video
-        - una cámara USB
-        - una futura Raspberry Pi Camera
+    Utiliza MediaPipe Face Landmarker (API Tasks).
     """
 
     # --------------------------------------------------------
-    # Landmarks del contorno ocular utilizados por el
-    # algoritmo original.
+    # Landmarks del contorno ocular.
+    #
+    # Estos índices son compatibles con la malla facial
+    # de MediaPipe utilizada por el algoritmo original.
     # --------------------------------------------------------
 
     LEFT_EYE = [362, 385, 387, 263, 373, 380]
@@ -28,7 +30,8 @@ class EyeTracker:
         self,
         blink_threshold=0.2,
         blink_window_size=5,
-        blink_cooldown=0.5
+        blink_cooldown=0.5,
+        model_path=None
     ):
 
         self.blink_threshold = blink_threshold
@@ -36,16 +39,69 @@ class EyeTracker:
         self.blink_cooldown = blink_cooldown
 
         # ----------------------------------------------------
-        # MediaPipe Face Mesh
+        # Localizar modelo Face Landmarker
         # ----------------------------------------------------
 
-        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
+        if model_path is None:
+
+            possible_paths = [
+                os.path.join(
+                    os.path.dirname(__file__),
+                    "models",
+                    "face_landmarker.task"
+                ),
+                os.path.join(
+                    os.getcwd(),
+                    "models",
+                    "face_landmarker.task"
+                ),
+                "models/face_landmarker.task",
+                "face_landmarker.task"
+            ]
+
+            for path in possible_paths:
+                if os.path.exists(path):
+                    model_path = path
+                    break
+
+        if model_path is None or not os.path.exists(model_path):
+            raise FileNotFoundError(
+                "No se encontró 'face_landmarker.task'. "
+                "Colócalo en la carpeta 'models/'."
+            )
+
+        print(
+            f"[EYE] Loading MediaPipe Face Landmarker: "
+            f"{os.path.abspath(model_path)}"
         )
+
+        # ----------------------------------------------------
+        # MediaPipe Tasks
+        # ----------------------------------------------------
+
+        BaseOptions = mp.tasks.BaseOptions
+        FaceLandmarker = mp.tasks.vision.FaceLandmarker
+        FaceLandmarkerOptions = mp.tasks.vision.FaceLandmarkerOptions
+        RunningMode = mp.tasks.vision.RunningMode
+
+        options = FaceLandmarkerOptions(
+            base_options=BaseOptions(
+                model_asset_path=model_path
+            ),
+            running_mode=RunningMode.VIDEO,
+            num_faces=1,
+            min_face_detection_confidence=0.5,
+            min_face_presence_confidence=0.5,
+            min_tracking_confidence=0.5,
+            output_face_blendshapes=False,
+            output_facial_transformation_matrixes=False
+        )
+
+        self.face_landmarker = FaceLandmarker.create_from_options(
+            options
+        )
+
+        print("[EYE] MediaPipe Face Landmarker loaded successfully.")
 
         # ----------------------------------------------------
         # Estado temporal
@@ -59,9 +115,19 @@ class EyeTracker:
         self.previous_gaze = None
         self.previous_timestamp = None
 
-        # Historial utilizado posteriormente para
-        # detección de fijaciones.
         self.gaze_history = []
+
+        # ----------------------------------------------------
+        # Último resultado de MediaPipe
+        #
+        # Se conserva para draw_debug() y evita volver a
+        # ejecutar MediaPipe sobre el mismo frame.
+        # ----------------------------------------------------
+
+        self.last_landmarks = None
+
+        # Timestamp utilizado por MediaPipe VIDEO mode.
+        self.last_timestamp_ms = -1
 
     # ========================================================
     # UTILIDADES
@@ -123,12 +189,40 @@ class EyeTracker:
             cv2.COLOR_BGR2RGB
         )
 
-        results = self.face_mesh.process(frame_rgb)
+        # ----------------------------------------------------
+        # Convertir a MediaPipe Image
+        # ----------------------------------------------------
 
-        if not results.multi_face_landmarks:
+        mp_image = mp.Image(
+            image_format=mp.ImageFormat.SRGB,
+            data=frame_rgb
+        )
+
+        # MediaPipe VIDEO mode requiere timestamps
+        # estrictamente crecientes en milisegundos.
+        timestamp_ms = int(timestamp * 1000)
+
+        if timestamp_ms <= self.last_timestamp_ms:
+            timestamp_ms = self.last_timestamp_ms + 1
+
+        self.last_timestamp_ms = timestamp_ms
+
+        # ----------------------------------------------------
+        # Detectar landmarks
+        # ----------------------------------------------------
+
+        results = self.face_landmarker.detect_for_video(
+            mp_image,
+            timestamp_ms
+        )
+
+        if not results.face_landmarks:
+            self.last_landmarks = None
             return None
 
-        landmarks = results.multi_face_landmarks[0].landmark
+        landmarks = results.face_landmarks[0]
+
+        self.last_landmarks = landmarks
 
         height, width, _ = frame.shape
 
@@ -188,20 +282,14 @@ class EyeTracker:
         # ====================================================
         # "PUPIL" / IRIS PROXY
         # ====================================================
-
+        #
         # IMPORTANTE:
         #
-        # El repositorio original llama a estas medidas
-        # "pupil_size", pero en realidad los landmarks 0 y 3
-        # representan los extremos del ojo.
+        # Esta característica NO es una medición real de la
+        # pupila.
         #
-        # Por compatibilidad con el dataset conservamos
-        # temporalmente esta característica con el mismo
-        # nombre.
-        #
-        # Más adelante debemos decidir si sustituirla por
-        # una medida basada realmente en los landmarks del
-        # iris.
+        # Se conserva aquí la lógica original para mantener
+        # compatibilidad con el código existente.
         # ====================================================
 
         lx0, ly0 = left_eye[0]
@@ -301,7 +389,10 @@ class EyeTracker:
 
         self.previous_timestamp = timestamp
 
-        # Guardamos para futuras fijaciones.
+        # ----------------------------------------------------
+        # Historial
+        # ----------------------------------------------------
+
         self.gaze_history.append(
             (
                 gaze_x,
@@ -350,7 +441,6 @@ class EyeTracker:
             "Index Binocular":
                 len(self.gaze_history) - 1,
 
-            # Información útil para depuración.
             "left_ear": left_ear,
             "right_ear": right_ear
         }
@@ -361,34 +451,24 @@ class EyeTracker:
 
     def draw_debug(self, frame):
         """
-        Dibuja landmarks oculares sobre un frame.
+        Dibuja los landmarks oculares del último frame procesado.
 
-        Esta función se utilizará posteriormente en el
-        feed de tiempo real.
+        No vuelve a ejecutar MediaPipe.
         """
 
-        frame_rgb = cv2.cvtColor(
-            frame,
-            cv2.COLOR_BGR2RGB
-        )
-
-        results = self.face_mesh.process(frame_rgb)
-
-        if not results.multi_face_landmarks:
+        if self.last_landmarks is None:
             return frame
-
-        landmarks = results.multi_face_landmarks[0].landmark
 
         height, width, _ = frame.shape
 
         for index in self.LEFT_EYE + self.RIGHT_EYE:
 
             x = int(
-                landmarks[index].x * width
+                self.last_landmarks[index].x * width
             )
 
             y = int(
-                landmarks[index].y * height
+                self.last_landmarks[index].y * height
             )
 
             cv2.circle(
@@ -408,4 +488,5 @@ class EyeTracker:
     def close(self):
         """Libera los recursos de MediaPipe."""
 
-        self.face_mesh.close()
+        if self.face_landmarker is not None:
+            self.face_landmarker.close()
