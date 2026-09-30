@@ -1,0 +1,26 @@
+{
+  "timestamp": "20260930_103246",
+  "data_dir": "homogeneous_data",
+  "num_windows": 245,
+  "num_subjects": 24,
+  "num_patients": 204,
+  "num_controls": 41,
+  "window_size": 300,
+  "num_features": 5,
+  "feature_order": [
+    "gaze_x",
+    "gaze_y",
+    "gaze_velocity",
+    "pupil_size",
+    "blink"
+  ],
+  "test_subjects": [
+    "N_001",
+    "N_009",
+    "N_010",
+    "N_012",
+    "P_005",
+    "P_007"
+  ],
+  "evaluation_accuracy": 0.8478260869565217
+}

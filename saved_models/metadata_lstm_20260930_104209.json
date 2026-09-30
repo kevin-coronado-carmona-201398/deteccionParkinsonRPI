@@ -1,0 +1,83 @@
+{
+  "timestamp": "20260930_104209",
+  "data_dir": "homogeneous_data",
+  "num_windows": 245,
+  "num_subjects": 24,
+  "num_patients": 12,
+  "num_controls": 12,
+  "num_patient_windows": 204,
+  "num_control_windows": 41,
+  "window_size": 300,
+  "num_features": 5,
+  "feature_order": [
+    "gaze_x",
+    "gaze_y",
+    "gaze_velocity",
+    "pupil_size",
+    "blink"
+  ],
+  "train_subjects": [
+    "N_001",
+    "N_002",
+    "N_003",
+    "N_005",
+    "N_006",
+    "N_011",
+    "N_012",
+    "P_001",
+    "P_002",
+    "P_004",
+    "P_005",
+    "P_006",
+    "P_007",
+    "P_011"
+  ],
+  "validation_subjects": [
+    "N_009",
+    "N_010",
+    "P_009",
+    "P_010"
+  ],
+  "test_subjects": [
+    "N_004",
+    "N_007",
+    "N_008",
+    "P_003",
+    "P_008",
+    "P_012"
+  ],
+  "epochs_max": 30,
+  "best_epoch": 5,
+  "best_validation_loss": 0.6209667921066284,
+  "early_stopping_patience": 5,
+  "class_weight_train": {
+    "0": 2.7884615384615383,
+    "1": 0.6092436974789915
+  },
+  "class_weight_all": {
+    "0": 2.9878048780487805,
+    "1": 0.6004901960784313
+  },
+  "evaluation_window_accuracy": 0.7377049180327869,
+  "evaluation_subject_accuracy": 0.8333333333333334,
+  "window_confusion_matrix": [
+    [
+      8,
+      2
+    ],
+    [
+      14,
+      37
+    ]
+  ],
+  "subject_confusion_matrix": [
+    [
+      3,
+      0
+    ],
+    [
+      1,
+      2
+    ]
+  ]
+}
