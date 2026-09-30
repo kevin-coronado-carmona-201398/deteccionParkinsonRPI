@@ -1,3 +1,11 @@
 .venv/
 __pycache__/
 *.pyc
+
+homogeneous_data/
+eye_metrics_output.csv
+cleaned_file.csv
+prediction_result.txt
+best_10000_segment.csv
+*.mp4
+.vscode/
