@@ -1,0 +1,234 @@
+========================================
+PARKINSON EYE TRACKING - SETUP RÁPIDO
+========================================
+
+Proyecto:
+Prototipo de detección experimental de patrones asociados a la enfermedad
+de Parkinson mediante seguimiento ocular y aprendizaje automático.
+
+Hardware:
+- Raspberry Pi 4
+- Raspberry Pi Camera Module OV5647
+- microSD
+- Monitor
+- Teclado y mouse
+- Fuente de alimentación
+- Cámara USB opcional como respaldo
+
+
+========================================
+1. ACTUALIZAR EL SISTEMA
+========================================
+
+Ejecutar:
+
+sudo apt update
+sudo apt upgrade -y
+
+
+========================================
+2. VERIFICAR LA CÁMARA
+========================================
+
+Comprobar que la cámara sea detectada:
+
+rpicam-hello --list-cameras
+
+Debe aparecer una cámara, por ejemplo:
+
+ov5647
+
+También se puede realizar una prueba de captura:
+
+rpicam-vid -n -t 5s \
+  --codec mjpeg \
+  --width 640 \
+  --height 480 \
+  --framerate 30 \
+  -o test.mjpeg
+
+Si el archivo test.mjpeg se genera correctamente, la cámara funciona.
+
+
+========================================
+3. VERIFICAR PYTHON
+========================================
+
+El proyecto utiliza Python 3.12.
+
+Comprobar:
+
+python3 --version
+
+Debe mostrar una versión 3.12.x.
+
+
+========================================
+4. CREAR EL ENTORNO VIRTUAL
+========================================
+
+Desde la carpeta del proyecto:
+
+python3.12 -m venv venv312
+
+Activar:
+
+source venv312/bin/activate
+
+Después de activarlo, el terminal debería mostrar:
+
+(venv312)
+
+
+========================================
+5. ACTUALIZAR PIP
+========================================
+
+python -m pip install --upgrade pip
+
+
+========================================
+6. INSTALAR LAS DEPENDENCIAS
+========================================
+
+Instalar las dependencias del proyecto:
+
+pip install -r requirements.txt
+
+
+========================================
+7. COMPROBAR LAS DEPENDENCIAS
+========================================
+
+Ejecutar:
+
+python -c "import numpy; print('NumPy OK')"
+
+python -c "import cv2; print('OpenCV OK')"
+
+python -c "import mediapipe; print('MediaPipe OK')"
+
+python -c "import tensorflow; print('TensorFlow OK')"
+
+python -c "from google.protobuf import __version__; print('Protobuf:', __version__)"
+
+
+========================================
+8. COMPROBAR EL EYE TRACKER
+========================================
+
+Ejecutar:
+
+python -c "from eye_tracking import EyeTracker; t=EyeTracker(); print('EyeTracker OK'); t.close()"
+
+Si aparece:
+
+EyeTracker OK
+
+la inicialización de MediaPipe y EyeTracker fue correcta.
+
+
+========================================
+9. COLOCAR EL MODELO
+========================================
+
+El modelo entrenado debe encontrarse dentro de:
+
+saved_models/
+
+Modelo utilizado por la versión final:
+
+saved_models/lstm_20260930_104209.keras
+
+También debe estar disponible su archivo de metadatos:
+
+saved_models/metadata_lstm_20260930_104209.json
+
+
+========================================
+10. EJECUTAR EL SISTEMA
+========================================
+
+Activar el entorno virtual si todavía no está activo:
+
+source venv312/bin/activate
+
+Ejecutar:
+
+python realtime_detection.py
+
+
+========================================
+11. FUNCIONAMIENTO
+========================================
+
+El programa realiza automáticamente:
+
+1. Carga el modelo LSTM.
+2. Intenta utilizar primero la cámara Raspberry Pi.
+3. Ejecuta rpicam-vid.
+4. Recibe los frames MJPEG.
+5. Procesa los frames mediante OpenCV.
+6. Detecta puntos faciales mediante MediaPipe.
+7. Extrae las características oculares.
+8. Acumula 300 muestras.
+9. Ejecuta la inferencia del modelo.
+10. Calcula una puntuación entre 0 y 1.
+11. Muestra la clasificación en pantalla.
+
+Clasificaciones:
+
+Puntuación > 0.60
+    PARKINSON SCORE HIGH
+
+Puntuación < 0.40
+    CONTROL SCORE HIGH
+
+Entre 0.40 y 0.60
+    UNCERTAIN
+
+
+========================================
+12. SALIR DEL PROGRAMA
+========================================
+
+Presionar:
+
+Q
+
+El programa debe mostrar:
+
+[SYSTEM] Q pressed. Exiting...
+[SYSTEM] Releasing resources...
+[SYSTEM] Shutdown complete.
+
+
+========================================
+13. SI LA CÁMARA RASPBERRY PI NO FUNCIONA
+========================================
+
+El programa intenta automáticamente utilizar una cámara USB
+como alternativa.
+
+Conectar la cámara USB y ejecutar nuevamente:
+
+python realtime_detection.py
+
+
+========================================
+14. ESTRUCTURA MÍNIMA DEL PROYECTO
+========================================
+
+deteccionParkinsonRPI/
+│
+├── realtime_detection.py
+├── recording.py
+├── eye_tracking.py
+├── requirements.txt
+├── SETUP_RASPBERRY_PI.txt
+│
+├── saved_models/
+│   ├── lstm_20260930_104209.keras
+│   └── metadata_lstm_20260930_104209.json
+│
+└── venv312/

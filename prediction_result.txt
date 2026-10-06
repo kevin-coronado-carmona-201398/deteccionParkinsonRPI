@@ -1,4 +1,0 @@
-Input File: cleaned_file.csv
-Prediction: Non-Parkinson's
-Probability: 0.0176
-Confidence: High
